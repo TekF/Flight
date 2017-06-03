@@ -5,6 +5,7 @@ A series of WebGL sketches about flight.
  * [Fly](http://TekF.github.io/Flight/fly.html)
  * [Heightfield](http://TekF.github.io/Flight/heightfield.html)
  * [Quaternion](http://TekF.github.io/Flight/quaternion.html)
+ * [Full Screen & Higher Quality Terrain](http://TekF.github.io/Flight/fullscreen.html)
 
 # Controls
 
