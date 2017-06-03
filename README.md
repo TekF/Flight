@@ -5,3 +5,7 @@ A series of WebGL sketches about flight.
  * [Fly](http://TekF.github.io/Flight/fly.html)
  * [Heightfield](http://TekF.github.io/Flight/heightfield.html)
  * [Quaternion](http://TekF.github.io/Flight/quaternion.html)
+
+# Controls
+
+Gamepad - R2/L2 - accelerate/brake, sticks & R1/R2 - rotate/move laterally
