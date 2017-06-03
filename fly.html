@@ -1,0 +1,379 @@
+<!DOCTYPE html>
+<html>
+	<head>
+		<meta charset="utf-8" />
+		<title>Fly</title>
+	</head>
+	<body>
+		<canvas id="screen" width="1200px" height="675px"/>
+		<script>
+		
+
+// render a full screen pass, and draw a screenspace 3D view
+// then render a heightfield
+// then 3D flight
+// [then 2D drift, then 3D drift]
+		
+
+var canvas = document.getElementById("screen");
+var gl = canvas.getContext( "webgl2" );
+
+
+/*****************
+ * VERTEX ARRAYS *
+ *****************/
+
+var fullScreenTri = new Object();
+fullScreenTri.array =
+	new Float32Array([
+		-1,-1,
+		-1,3,
+		3,-1
+	]);
+
+var arrow = new Object();
+arrow.array =
+	new Float32Array([
+		-.05,-.05,
+		0,.1,
+		0,.0,
+		.05,-.05
+	]);
+
+function MakeVAPos2D( array )
+{
+	let vb = gl.createVertexArray();
+	gl.bindVertexArray( vb );
+	
+	let buf = gl.createBuffer();
+	gl.bindBuffer( gl.ARRAY_BUFFER, buf );
+	gl.bufferData( gl.ARRAY_BUFFER, array, gl.STATIC_DRAW );
+	
+	gl.vertexAttribPointer( 0, 2, gl.FLOAT, false, 8, 0 );
+	gl.enableVertexAttribArray(0);
+	
+	gl.bindBuffer( gl.ARRAY_BUFFER, null );
+	gl.bindVertexArray( null );
+	
+	return vb;
+}
+ 
+fullScreenTri.va = MakeVAPos2D( fullScreenTri.array );
+fullScreenTri.count = fullScreenTri.array.length / 2;
+
+arrow.va = MakeVAPos2D( arrow.array );
+arrow.count = arrow.array.length / 2;
+
+
+/***********
+ * SHADERS *
+ ***********/
+
+var updateEffect = new Object();
+updateEffect.vertexShader = new Object();
+updateEffect.vertexShader.source =
+	`#version 300 es
+	precision highp float;
+	precision highp int;
+	
+	// INPUTS
+	in vec2 vertexPosition;
+	
+	void main()
+	{
+		gl_Position = vec4( vertexPosition, 0, 1 );
+	}
+	`;
+
+updateEffect.pixelShader = new Object();
+updateEffect.pixelShader.source =
+	`#version 300 es
+	precision highp float;
+	precision highp int;
+	
+	uniform sampler2D gameDataBuffer;
+	
+	uniform vec4 gamepad0_axes;
+	uniform vec4 gamepad0_buttons0;
+	uniform vec4 gamepad0_buttons1;
+	uniform vec4 gamepad0_buttons2;
+	uniform vec4 gamepad0_buttons3;
+	
+	//layout(location=0)
+	out vec4 outColour;
+	
+	vec3 Rotate( vec3 d, vec4 rot )
+	{
+		d.yz = d.yz*cos(rot.y) + d.zy*vec2(-1,1)*sin(rot.y);
+		d.xz = d.xz*cos(rot.x) + d.zx*vec2(-1,1)*sin(rot.x);
+		return d;
+	}
+
+	void main()
+	{
+		float steer = -sign(gamepad0_axes.z)*smoothstep(.07,1.,abs(gamepad0_axes.z)); // deadzone
+		float pitch = -sign(gamepad0_axes.w)*smoothstep(.07,1.,abs(gamepad0_axes.w));
+		float throttle = smoothstep(.05,1.,gamepad0_buttons1.w) - smoothstep(.05,1.,gamepad0_buttons1.z)*.5; // R2-L2
+		float strafe = sign(gamepad0_axes.x)*smoothstep(.07,1.,abs(gamepad0_axes.x));
+		float lift = -sign(gamepad0_axes.y)*smoothstep(.07,1.,abs(gamepad0_axes.y));
+	
+//this moans about needing clearing, but reading it \/ doesn't, but it's double buffered so how does it know?!
+		vec4 pos = texelFetch( gameDataBuffer, ivec2(0,0), 0 );
+		vec4 rot = texelFetch( gameDataBuffer, ivec2(1,0), 0 );
+
+		vec4 deltaPos = texelFetch( gameDataBuffer, ivec2(0,1), 0 );
+		vec4 deltaRot = texelFetch( gameDataBuffer, ivec2(1,1), 0 );
+		
+		vec3 right = Rotate(vec3(1,0,0),rot);
+		vec3 up = Rotate(vec3(0,1,0),rot);
+		vec3 forward = Rotate(vec3(0,0,1),rot);
+		
+		deltaPos.xyz *= .99;
+		deltaPos.xyz += right * strafe * .002; 
+		deltaPos.xyz += up * lift * .002; 
+		deltaPos.xyz += forward * throttle * .002; 
+		deltaPos.w = .0;
+		
+		deltaRot *= .9;
+		deltaRot.x += steer * .005;
+		deltaRot.y += pitch * .005;
+
+		pos += deltaPos;
+		rot += deltaRot;
+		
+		outColour = vec4(.4,.3,-1,1);
+		if ( gl_FragCoord.y < 1. )
+		{
+			if ( gl_FragCoord.x < 1. ) outColour = pos;
+			else if ( gl_FragCoord.x < 2. ) outColour = rot;
+		}
+		else if ( gl_FragCoord.y < 2. )
+		{
+			if ( gl_FragCoord.x < 1. ) outColour = deltaPos;
+			else if ( gl_FragCoord.x < 2. ) outColour = deltaRot;
+		}
+	}
+	`;
+
+var renderEffect = new Object();
+renderEffect.vertexShader = new Object();
+renderEffect.vertexShader.source = updateEffect.vertexShader.source;
+
+renderEffect.pixelShader = new Object();
+renderEffect.pixelShader.source =
+	`#version 300 es
+	precision highp float;
+	precision highp int;
+	
+	uniform sampler2D gameDataBuffer;
+	
+	uniform vec2 gResolution;
+	
+	out vec4 outColour;
+	
+	vec3 Rotate( vec3 d, vec4 rot )
+	{
+		d.yz = d.yz*cos(rot.y) + d.zy*vec2(-1,1)*sin(rot.y);
+		d.xz = d.xz*cos(rot.x) + d.zx*vec2(-1,1)*sin(rot.x);
+		return d;
+	}
+
+	void main ()
+	{
+		// read position & rotation from gameDataBuffer
+		vec4 pos = texelFetch( gameDataBuffer, ivec2(0,0), 0 );
+		vec4 rot = texelFetch( gameDataBuffer, ivec2(1,0), 0 );
+		
+		vec3 ray;
+		ray.xy = (gl_FragCoord.xy - gResolution.xy*.5)/gResolution.x;
+		ray.z = 1.;
+		ray = normalize(ray);
+		
+		ray = Rotate(ray,rot);
+		
+		
+		// some kind of scene
+		vec4 plane = vec4(0,1,0,-.3);
+		plane.xyz = normalize(plane.xyz);
+		float t = (plane.w - dot(plane.xyz,pos.xyz))/dot(plane.xyz,ray);
+		
+		outColour.rgb = vec3(.5);
+		
+		if ( t > .0 )
+		{
+			vec3 u = pos.xyz+ray*t;
+			u = fract((u-.25)*.5)-.5;
+			float d = exp2(-t/20.);
+			d = mix( .5-d*.5, .5+d*.5, step(.0,u.x*u.y*u.z) );
+			outColour.rgb = vec3(d);
+		}
+	
+		outColour.rgb = pow(outColour.rgb,vec3(1./2.2));
+		outColour.a = 1.;
+	}
+	`;
+
+updateEffect.vertexShader.shader = gl.createShader( gl.VERTEX_SHADER );
+gl.shaderSource( updateEffect.vertexShader.shader, updateEffect.vertexShader.source );
+gl.compileShader( updateEffect.vertexShader.shader );
+console.log( gl.getShaderInfoLog( updateEffect.vertexShader.shader ) );
+
+updateEffect.pixelShader.shader = gl.createShader( gl.FRAGMENT_SHADER );
+gl.shaderSource( updateEffect.pixelShader.shader, updateEffect.pixelShader.source );
+gl.compileShader( updateEffect.pixelShader.shader );
+console.log( gl.getShaderInfoLog( updateEffect.pixelShader.shader ) );
+
+updateEffect.effect = gl.createProgram();
+gl.attachShader( updateEffect.effect, updateEffect.vertexShader.shader );
+gl.attachShader( updateEffect.effect, updateEffect.pixelShader.shader );
+gl.linkProgram( updateEffect.effect );
+
+renderEffect.vertexShader.shader = gl.createShader( gl.VERTEX_SHADER );
+gl.shaderSource( renderEffect.vertexShader.shader, renderEffect.vertexShader.source );
+gl.compileShader( renderEffect.vertexShader.shader );
+console.log( gl.getShaderInfoLog( renderEffect.vertexShader.shader ) );
+
+renderEffect.pixelShader.shader = gl.createShader( gl.FRAGMENT_SHADER );
+gl.shaderSource( renderEffect.pixelShader.shader, renderEffect.pixelShader.source );
+gl.compileShader( renderEffect.pixelShader.shader );
+console.log( gl.getShaderInfoLog( renderEffect.pixelShader.shader ) );
+
+renderEffect.effect = gl.createProgram();
+gl.attachShader( renderEffect.effect, renderEffect.vertexShader.shader );
+gl.attachShader( renderEffect.effect, renderEffect.pixelShader.shader );
+gl.linkProgram( renderEffect.effect );
+
+gl.bindAttribLocation(updateEffect.effect, 0, "vertexPosition");
+gl.bindAttribLocation(renderEffect.effect, 0, "vertexPosition");
+
+
+/*****************
+ * FRAME BUFFERS *
+ *****************/
+ 
+gl.getExtension("EXT_color_buffer_float"); // I thought this was standard in webgl2, but apparently not!?
+
+var gameDataBuffer = [ new Object(), new Object() ];
+
+gameDataBuffer[0].texture = gl.createTexture();
+gl.bindTexture( gl.TEXTURE_2D, gameDataBuffer[0].texture );
+gl.texImage2D( gl.TEXTURE_2D, 0, gl.RGBA32F, 4, 4, 0, gl.RGBA, gl.FLOAT, null );
+//gl.texStorage2D( gl.TEXTURE_2D, 1, gl.RGBA32F, 4, 4 );
+
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_BASE_LEVEL, 0);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAX_LEVEL, 0);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+
+
+gameDataBuffer[0].frameBuffer = gl.createFramebuffer();
+gameDataBuffer[0].frameBuffer.width = 4;
+gameDataBuffer[0].frameBuffer.height = 4;
+gl.bindFramebuffer( gl.FRAMEBUFFER, gameDataBuffer[0].frameBuffer );
+gl.framebufferTexture2D( gl.DRAW_FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, gameDataBuffer[0].texture, 0 );
+
+gl.bindFramebuffer( gl.FRAMEBUFFER, null );
+gl.bindTexture( gl.TEXTURE_2D, null );
+
+gameDataBuffer[1].texture = gl.createTexture();
+gl.bindTexture( gl.TEXTURE_2D, gameDataBuffer[1].texture );
+gl.texImage2D( gl.TEXTURE_2D, 0, gl.RGBA32F, 4, 4, 0, gl.RGBA, gl.FLOAT, null );
+//gl.texStorage2D( gl.TEXTURE_2D, 1, gl.RGBA32F, 4, 4 );
+
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_BASE_LEVEL, 0);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAX_LEVEL, 0);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+
+
+gameDataBuffer[1].frameBuffer = gl.createFramebuffer();
+gameDataBuffer[1].frameBuffer.width = 4;
+gameDataBuffer[1].frameBuffer.height = 4;
+gl.bindFramebuffer( gl.FRAMEBUFFER, gameDataBuffer[1].frameBuffer );
+gl.framebufferTexture2D( gl.DRAW_FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, gameDataBuffer[1].texture, 0 );
+
+gl.bindFramebuffer( gl.FRAMEBUFFER, null );
+gl.bindTexture( gl.TEXTURE_2D, null );
+
+
+/**************
+ * FRAME LOOP *
+ **************/
+
+var flip = 0;
+
+// Update the game data buffer for the next frame
+function Update()
+{
+	flip = 1-flip;
+
+	gl.bindFramebuffer( gl.FRAMEBUFFER, gameDataBuffer[flip].frameBuffer );
+    gl.viewport(0, 0, gameDataBuffer[flip].frameBuffer.width, gameDataBuffer[flip].frameBuffer.height);
+	gl.clearColor(0.0, 0.0, 0.0, 1.0);
+	gl.clear( gl.COLOR_BUFFER_BIT );
+	
+	gl.useProgram( updateEffect.effect );
+
+	// bind the game data buffer as a texture, so the shader can read the previous frame's values and update them
+	gl.activeTexture( gl.TEXTURE0 );
+	gl.bindTexture( gl.TEXTURE_2D, gameDataBuffer[1-flip].texture );
+	gl.uniform1i( gl.getUniformLocation( updateEffect.effect, "gameDataBuffer" ), 0 ); // this never changes, can we just hardcode it in the shader?
+
+	// Read the gamepad	and pass straight through to the shader
+	let pad = navigator.getGamepads()[0];
+	if ( pad && pad.axes ) gl.uniform4f( gl.getUniformLocation( updateEffect.effect, "gamepad0_axes" ), pad.axes[0], pad.axes[1], pad.axes[2], pad.axes[3] );
+	if ( pad && pad.buttons )
+	{
+		gl.uniform4f( gl.getUniformLocation( updateEffect.effect, "gamepad0_buttons0" ), pad.buttons[ 0].value, pad.buttons[ 1].value, pad.buttons[ 2].value, pad.buttons[ 3].value );
+		gl.uniform4f( gl.getUniformLocation( updateEffect.effect, "gamepad0_buttons1" ), pad.buttons[ 4].value, pad.buttons[ 5].value, pad.buttons[ 6].value, pad.buttons[ 7].value );
+		gl.uniform4f( gl.getUniformLocation( updateEffect.effect, "gamepad0_buttons2" ), pad.buttons[ 8].value, pad.buttons[ 9].value, pad.buttons[10].value, pad.buttons[11].value );
+		gl.uniform4f( gl.getUniformLocation( updateEffect.effect, "gamepad0_buttons3" ), pad.buttons[12].value, pad.buttons[13].value, pad.buttons[14].value, pad.buttons[15].value );
+	}
+
+	gl.bindVertexArray(fullScreenTri.va);
+	gl.drawArrays(gl.TRIANGLE_STRIP, 0, fullScreenTri.count);
+
+	// do we actually need to clean up?
+	gl.bindVertexArray(null);
+	gl.useProgram(null);
+	gl.bindTexture(gl.TEXTURE_2D, null);
+	gl.bindFramebuffer( gl.FRAMEBUFFER, null );
+	gl.viewport(0, 0, canvas.width, canvas.height );
+}
+
+// Render the scene with data from the current game data buffer
+function Render()
+{
+	gl.bindFramebuffer( gl.FRAMEBUFFER, null );
+	gl.viewport(0, 0, canvas.width, canvas.height );
+	gl.clearColor(0.0, 0.0, 0.0, 1.0);
+	gl.clear( gl.COLOR_BUFFER_BIT );
+	
+	gl.useProgram( renderEffect.effect );
+
+	gl.activeTexture( gl.TEXTURE0 );
+	gl.bindTexture( gl.TEXTURE_2D, gameDataBuffer[flip].texture );
+	gl.uniform1i( gl.getUniformLocation( renderEffect.effect, "gameDataBuffer" ), 0 ); // this never changes, can we just hardcode it in the shader?
+	
+	gl.uniform2f( gl.getUniformLocation( renderEffect.effect, "gResolution" ), canvas.width, canvas.height );
+	
+	gl.bindVertexArray(fullScreenTri.va);
+	gl.drawArrays(gl.TRIANGLE_STRIP, 0, fullScreenTri.count);
+	
+	gl.bindVertexArray(null);
+	gl.useProgram(null);
+	gl.bindTexture(gl.TEXTURE_2D, null);
+}
+
+function Frame()// timestep )
+{
+	Update();
+	Render();
+	
+	window.requestAnimationFrame(Frame);
+}
+window.requestAnimationFrame(Frame);
+		
+		</script>
+	</body>
+</html>

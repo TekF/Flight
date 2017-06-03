@@ -1,0 +1,592 @@
+<!DOCTYPE html>
+<html>
+	<head>
+		<meta charset="utf-8" />
+		<title>Heightfield</title>
+	</head>
+	<body>
+		<canvas id="screen" width="1200px" height="675px"/>
+		<script>
+		
+
+// render a full screen pass, and draw a screenspace 3D view
+// then render a heightfield
+// then 3D flight
+// [then 2D drift, then 3D drift]
+		
+
+var canvas = document.getElementById("screen");
+var gl = canvas.getContext( "webgl2" );
+
+
+/*****************
+ * VERTEX ARRAYS *
+ *****************/
+
+function MakeVAPos2D( array )
+{
+	let vb = gl.createVertexArray();
+	gl.bindVertexArray( vb );
+	
+	let buf = gl.createBuffer();
+	gl.bindBuffer( gl.ARRAY_BUFFER, buf );
+	gl.bufferData( gl.ARRAY_BUFFER, array, gl.STATIC_DRAW );
+	
+	gl.vertexAttribPointer( 0, 2, gl.FLOAT, false, 8, 0 );
+	gl.enableVertexAttribArray(0);
+	
+	gl.bindBuffer( gl.ARRAY_BUFFER, null );
+	gl.bindVertexArray( null );
+	
+	return vb;
+}
+ 
+var fullScreenTri = new Object();
+fullScreenTri.array =
+	new Float32Array([
+		-1,-1,
+		-1,3,
+		3,-1
+	]);
+fullScreenTri.va = MakeVAPos2D( fullScreenTri.array );
+fullScreenTri.count = fullScreenTri.array.length / 2;
+
+var heightfield = new Object();
+heightfield.vertexData = [];
+heightfield.res = 512;
+for ( z=0; z <= heightfield.res; z++ )
+{
+	for ( x=0; x <= heightfield.res; x++ )
+	{
+		heightfield.vertexData.push(x/heightfield.res);
+		heightfield.vertexData.push(z/heightfield.res);
+	}
+}
+heightfield.vertexArray = MakeVAPos2D( new Float32Array( heightfield.vertexData ) );
+//heightfield.count = heightfield.vertexData.length / 2;
+
+heightfield.indices = [];
+let row = heightfield.res+1;
+for ( z=0; z < heightfield.res; z++ )
+{
+	for ( x=0; x < heightfield.res; x++ )
+	{
+		let idx = z*row+x;
+		heightfield.indices.push(idx);
+		heightfield.indices.push(idx+1);
+		heightfield.indices.push(idx+row);
+		heightfield.indices.push(idx+row);
+		heightfield.indices.push(idx+1);
+		heightfield.indices.push(idx+row+1);
+	}
+}
+heightfield.indexArray = gl.createBuffer();
+gl.bindBuffer( gl.ELEMENT_ARRAY_BUFFER, heightfield.indexArray );
+gl.bufferData( gl.ELEMENT_ARRAY_BUFFER, new Uint32Array(heightfield.indices), gl.STATIC_DRAW );
+heightfield.indexCount = heightfield.indices.length;
+gl.bindBuffer( gl.ELEMENT_ARRAY_BUFFER, null );
+
+// build index buffer
+
+
+/***********
+ * SHADERS *
+ ***********/
+
+var updateEffect = new Object();
+updateEffect.vertexShader = new Object();
+updateEffect.vertexShader.source =
+	`#version 300 es
+	precision highp float;
+	precision highp int;
+	
+	// INPUTS
+	in vec2 vertexPosition;
+	
+	void main()
+	{
+		gl_Position = vec4( vertexPosition, 0, 1 );
+	}
+	`;
+
+updateEffect.pixelShader = new Object();
+updateEffect.pixelShader.source =
+	`#version 300 es
+	precision highp float;
+	precision highp int;
+	
+	uniform sampler2D gameDataBuffer;
+	
+	uniform vec4 gamepad0_axes;
+	uniform vec4 gamepad0_buttons0;
+	uniform vec4 gamepad0_buttons1;
+	uniform vec4 gamepad0_buttons2;
+	uniform vec4 gamepad0_buttons3;
+	
+	//layout(location=0)
+	out vec4 outColour;
+	
+	vec3 Rotate( vec3 d, vec4 rot )
+	{
+		d.yz = d.yz*cos(rot.y) + d.zy*vec2(-1,1)*sin(rot.y);
+		d.xz = d.xz*cos(rot.x) + d.zx*vec2(-1,1)*sin(rot.x);
+		return d;
+	}
+
+	void main()
+	{
+		float steer = -sign(gamepad0_axes.z)*smoothstep(.15,1.,abs(gamepad0_axes.z)); // deadzone
+		float pitch = -sign(gamepad0_axes.w)*smoothstep(.15,1.,abs(gamepad0_axes.w));
+		float throttle = smoothstep(.05,1.,gamepad0_buttons1.w) - smoothstep(.05,1.,gamepad0_buttons1.z)*.5; // R2-L2
+		float strafe = sign(gamepad0_axes.x)*smoothstep(.15,1.,abs(gamepad0_axes.x));
+		float lift = -sign(gamepad0_axes.y)*smoothstep(.15,1.,abs(gamepad0_axes.y));
+	
+//this moans about needing clearing, but reading it \/ doesn't, but it's double buffered so how does it know?!
+		vec4 pos = texelFetch( gameDataBuffer, ivec2(0,0), 0 );
+		vec4 rot = texelFetch( gameDataBuffer, ivec2(1,0), 0 );
+
+		vec4 deltaPos = texelFetch( gameDataBuffer, ivec2(0,1), 0 );
+		vec4 deltaRot = texelFetch( gameDataBuffer, ivec2(1,1), 0 );
+		
+		vec3 right = Rotate(vec3(1,0,0),rot);
+		vec3 up = Rotate(vec3(0,1,0),rot);
+		vec3 forward = Rotate(vec3(0,0,1),rot);
+		
+		deltaPos.xyz *= .99;
+		deltaPos.xyz += right * strafe * .002; 
+		deltaPos.xyz += up * lift * .002; 
+		deltaPos.xyz += forward * throttle * .002; 
+		deltaPos.w = .0;
+		
+		deltaRot *= .9;
+		deltaRot.x += steer * .005;
+		deltaRot.y += pitch * .005;
+
+		pos += deltaPos;
+		rot += deltaRot;
+		
+		outColour = vec4(.4,.3,-1,1);
+		if ( gl_FragCoord.y < 1. )
+		{
+			if ( gl_FragCoord.x < 1. ) outColour = pos;
+			else if ( gl_FragCoord.x < 2. ) outColour = rot;
+		}
+		else if ( gl_FragCoord.y < 2. )
+		{
+			if ( gl_FragCoord.x < 1. ) outColour = deltaPos;
+			else if ( gl_FragCoord.x < 2. ) outColour = deltaRot;
+		}
+	}
+	`;
+
+updateEffect.vertexShader.shader = gl.createShader( gl.VERTEX_SHADER );
+gl.shaderSource( updateEffect.vertexShader.shader, updateEffect.vertexShader.source );
+gl.compileShader( updateEffect.vertexShader.shader );
+console.log( gl.getShaderInfoLog( updateEffect.vertexShader.shader ) );
+
+updateEffect.pixelShader.shader = gl.createShader( gl.FRAGMENT_SHADER );
+gl.shaderSource( updateEffect.pixelShader.shader, updateEffect.pixelShader.source );
+gl.compileShader( updateEffect.pixelShader.shader );
+console.log( gl.getShaderInfoLog( updateEffect.pixelShader.shader ) );
+
+updateEffect.effect = gl.createProgram();
+gl.attachShader( updateEffect.effect, updateEffect.vertexShader.shader );
+gl.attachShader( updateEffect.effect, updateEffect.pixelShader.shader );
+gl.linkProgram( updateEffect.effect );
+
+
+var generateHeight = new Object();
+generateHeight.vertexShader = new Object();
+generateHeight.vertexShader.source = updateEffect.vertexShader.source;
+
+generateHeight.pixelShader = new Object();
+generateHeight.pixelShader.source =
+	`#version 300 es
+	precision highp float;
+	precision highp int;
+	
+	float hash( vec2 uv )
+	{
+		float h = dot(uv,vec2(127.1,201.3));
+		return fract(sin(h)*43758.5453123);
+	}	
+	
+	float noise( vec2 uv )
+	{
+		vec2 iuv = floor(uv);
+		vec2 fuv = uv - iuv;
+		fuv = fuv*fuv*(3.-2.*fuv);
+		return mix(
+				mix( hash(iuv+vec2(0,0)), hash(iuv+vec2(1,0)), fuv.x ),
+				mix( hash(iuv+vec2(0,1)), hash(iuv+vec2(1,1)), fuv.x ),
+				fuv.y
+			);
+	}
+	
+	uniform vec2 gHeightfieldResolution;
+
+	out vec4 outColour;
+	
+	void main()
+	{
+		vec2 uv = (gl_FragCoord.xy/gHeightfieldResolution.xy - .5) * 2048.f / 400.f + vec2(2);
+		
+		const float gain = .5;
+		const float offset = .5;
+		
+		float h = 0.;
+		float o = 1.;
+		float feedback = 1.;
+		for ( int octave=0; octave < 10; octave++ )
+		{
+			h += pow( (offset-abs(noise(uv)*2.-1.))/offset, 1. ) * feedback * .5 / o;
+			o *= 2.;
+			uv = sqrt(2.)*(uv.xy+uv.yx*vec2(-1,1)); // 2.*uv and rotated
+			feedback = mix( 1., h, gain );
+		}
+		
+		outColour = vec4(pow(h,1.),0,0,1);
+	}
+	`;
+
+generateHeight.vertexShader.shader = gl.createShader( gl.VERTEX_SHADER );
+gl.shaderSource( generateHeight.vertexShader.shader, generateHeight.vertexShader.source );
+gl.compileShader( generateHeight.vertexShader.shader );
+console.log( gl.getShaderInfoLog( generateHeight.vertexShader.shader ) );
+
+generateHeight.pixelShader.shader = gl.createShader( gl.FRAGMENT_SHADER );
+gl.shaderSource( generateHeight.pixelShader.shader, generateHeight.pixelShader.source );
+gl.compileShader( generateHeight.pixelShader.shader );
+console.log( gl.getShaderInfoLog( generateHeight.pixelShader.shader ) );
+
+generateHeight.effect = gl.createProgram();
+gl.attachShader( generateHeight.effect, generateHeight.vertexShader.shader );
+gl.attachShader( generateHeight.effect, generateHeight.pixelShader.shader );
+gl.linkProgram( generateHeight.effect );
+
+// make normal, albedo, specular (roughness, fresnel min) maps - MRT
+//generateMaps
+
+
+var renderHeightfield = new Object();
+renderHeightfield.vertexShader = new Object();
+renderHeightfield.vertexShader.source =
+	`#version 300 es
+	precision highp float;
+	precision highp int;
+	
+	uniform sampler2D gameDataBuffer;
+	
+	uniform vec2 gResolution;
+	
+	// INPUTS
+	in vec2 vertexUV;
+	
+	uniform sampler2D gHeightfield;
+	uniform vec2 gHeightfieldResolution;
+
+	float ReadHeightMap( vec2 uv )
+	{
+		/*return .5
+				+.20*(sin(uv.x*12.)+sin(uv.y*12.))
+				+.04*(sin(uv.x*60.)+sin(uv.y*60.))
+				+.008*(sin(uv.x*300.)+sin(uv.y*300.))
+				+.002*(sin(uv.x*1200.)+sin(uv.y*1200.)); // mesh is 1024 so this is 1 cycle/5ish verts*/
+		return texture( gHeightfield, uv ).x;
+	}
+	
+	vec3 Rotate( vec3 d, vec4 rot )
+	{
+		d.yz = d.yz*cos(rot.y) + d.zy*vec2(-1,1)*sin(rot.y);
+		d.xz = d.xz*cos(rot.x) + d.zx*vec2(-1,1)*sin(rot.x);
+		return d;
+	}
+
+	vec3 InvRotate( vec3 d, vec4 rot )
+	{
+		d.xz = d.xz*cos(rot.x) + d.zx*vec2(1,-1)*sin(rot.x);
+		d.yz = d.yz*cos(rot.y) + d.zy*vec2(1,-1)*sin(rot.y);
+		return d;
+	}
+	
+	out vec3 worldPos;
+	out vec3 viewPos;
+	out vec2 texCoord;
+	
+	void main()
+	{
+		vec4 camPos = texelFetch( gameDataBuffer, ivec2(0,0), 0 );
+		vec4 camRot = texelFetch( gameDataBuffer, ivec2(1,0), 0 );
+
+		worldPos.xz = (vertexUV-.5) * 1024.;
+		worldPos.y = (ReadHeightMap(vertexUV)-.5) * 50.;
+		
+//		worldPos.y -= 64.;
+		
+		texCoord = vertexUV;
+		
+		viewPos = worldPos - camPos.xyz;
+		viewPos = InvRotate(viewPos,camRot);
+		
+		float aspect = 16./9.;
+		float zoom = 1.;
+		
+		gl_Position.x = viewPos.x;
+		gl_Position.y = viewPos.y * aspect;
+		gl_Position.w = viewPos.z * zoom;
+// pos.z e [near,inf] -> clipPos.z/clipPos.w e [-1,1]
+/*1/z = [1/near,0]
+(Az+B)/z = A+B/z = [A+B/near, A]
+do we want [-1,1] or [1,-1]?
+A = 1, B = -2near => [-1,1]
+A = -1, B = 2near => [1,-1] 
+QED*/
+		gl_Position.z = 1.*gl_Position.w - 2.*.1;
+		
+		// todo: output normal - or maybe we just read that
+	}
+	`;
+
+renderHeightfield.pixelShader = new Object();
+renderHeightfield.pixelShader.source =
+	`#version 300 es
+	precision highp float;
+	precision highp int;
+	
+	in vec3 worldPos;
+	in vec3 viewPos;
+	in vec2 texCoord;
+	
+	out vec4 outColour;
+	
+	uniform sampler2D gHeightfield;
+	uniform vec2 gHeightfieldResolution;
+
+	float ReadHeightMap( vec2 uv )
+	{
+		/*return .5
+				+.20*(sin(uv.x*12.)+sin(uv.y*12.))
+				+.04*(sin(uv.x*60.)+sin(uv.y*60.))
+				+.008*(sin(uv.x*300.)+sin(uv.y*300.))
+				+.002*(sin(uv.x*1200.)+sin(uv.y*1200.)); // mesh is 1024 so this is 1 cycle/5ish verts*/
+		return texture( gHeightfield, uv ).x;
+	}
+	
+	void main ()
+	{
+		vec3 n;
+		float dd = 1./gHeightfieldResolution.x;
+		vec2 d = dd*vec2(1,0)*.5;
+		n.x = ReadHeightMap(texCoord+d.xy) - ReadHeightMap(texCoord-d.xy);
+		n.z = ReadHeightMap(texCoord+d.yx) - ReadHeightMap(texCoord-d.yx);
+		n.y = dd;
+		n = normalize(n);
+	
+//		vec3 u = fract((worldPos-.25)*.5)-.5;
+//		outColour.rgb = mix( vec3(.7), vec3(0), step(.0,u.x*u.z) );
+		
+//		outColour.rgb = n*.5+.5;
+
+		float l = max(.0,dot(n,normalize(vec3(-1,3,-2))));
+		vec3 light = mix( vec3(.1,.2,.3)*n.y, vec3(1), l );
+		
+		vec3 albedo = mix( vec3(.2), vec3(1), smoothstep(-5.,10.,worldPos.y) );
+		albedo = mix( vec3(.05,.2,.05), albedo, smoothstep(-15.,-5.,worldPos.y) );
+		
+		outColour.rgb = light * albedo;
+
+		// fog
+		outColour.rgb = mix( vec3(.4,.7,1), outColour.rgb, exp2(-vec3(1,3,8)*length(viewPos)/4000.) );
+		
+		outColour.rgb = pow(outColour.rgb,vec3(1./2.2));
+		outColour.a = 1.;
+	}
+	`;
+
+renderHeightfield.vertexShader.shader = gl.createShader( gl.VERTEX_SHADER );
+gl.shaderSource( renderHeightfield.vertexShader.shader, renderHeightfield.vertexShader.source );
+gl.compileShader( renderHeightfield.vertexShader.shader );
+console.log( gl.getShaderInfoLog( renderHeightfield.vertexShader.shader ) );
+
+renderHeightfield.pixelShader.shader = gl.createShader( gl.FRAGMENT_SHADER );
+gl.shaderSource( renderHeightfield.pixelShader.shader, renderHeightfield.pixelShader.source );
+gl.compileShader( renderHeightfield.pixelShader.shader );
+console.log( gl.getShaderInfoLog( renderHeightfield.pixelShader.shader ) );
+
+renderHeightfield.effect = gl.createProgram();
+gl.attachShader( renderHeightfield.effect, renderHeightfield.vertexShader.shader );
+gl.attachShader( renderHeightfield.effect, renderHeightfield.pixelShader.shader );
+gl.linkProgram( renderHeightfield.effect );
+
+gl.bindAttribLocation(updateEffect.effect, 0, "vertexPosition");
+gl.bindAttribLocation(renderHeightfield.effect, 0, "vertexPosition");
+
+
+/*****************
+ * FRAME BUFFERS *
+ *****************/
+ 
+gl.getExtension("EXT_color_buffer_float");
+gl.getExtension("OES_texture_float_linear");
+
+var heightBuffer = new Object();
+
+heightBuffer.width = 4096;
+heightBuffer.height = 4096;
+
+heightBuffer.texture = gl.createTexture();
+gl.bindTexture( gl.TEXTURE_2D, heightBuffer.texture );
+gl.texImage2D( gl.TEXTURE_2D, 0, gl.RGBA32F, heightBuffer.width, heightBuffer.height, 0, gl.RGBA, gl.FLOAT, null );
+
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_BASE_LEVEL, 0);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAX_LEVEL, 0);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.LINEAR);
+gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.LINEAR);
+
+heightBuffer.frameBuffer = gl.createFramebuffer();
+heightBuffer.frameBuffer.width = heightBuffer.width;
+heightBuffer.frameBuffer.height = heightBuffer.height;
+gl.bindFramebuffer( gl.FRAMEBUFFER, heightBuffer.frameBuffer );
+gl.framebufferTexture2D( gl.DRAW_FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, heightBuffer.texture, 0 );
+
+
+var gameDataBuffer = [ new Object(), new Object() ];
+
+for ( i=0; i < 2; i++ )
+{
+	gameDataBuffer[i].texture = gl.createTexture();
+	gl.bindTexture( gl.TEXTURE_2D, gameDataBuffer[i].texture );
+	gl.texImage2D( gl.TEXTURE_2D, 0, gl.RGBA32F, 4, 4, 0, gl.RGBA, gl.FLOAT, null );
+	//gl.texStorage2D( gl.TEXTURE_2D, 1, gl.RGBA32F, 4, 4 );
+
+	gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_BASE_LEVEL, 0);
+	gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAX_LEVEL, 0);
+	gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MIN_FILTER, gl.NEAREST);
+	gl.texParameteri(gl.TEXTURE_2D, gl.TEXTURE_MAG_FILTER, gl.NEAREST);
+
+	gameDataBuffer[i].frameBuffer = gl.createFramebuffer();
+	gameDataBuffer[i].frameBuffer.width = 4;
+	gameDataBuffer[i].frameBuffer.height = 4;
+	gl.bindFramebuffer( gl.FRAMEBUFFER, gameDataBuffer[i].frameBuffer );
+	gl.framebufferTexture2D( gl.DRAW_FRAMEBUFFER, gl.COLOR_ATTACHMENT0, gl.TEXTURE_2D, gameDataBuffer[i].texture, 0 );
+}
+
+gl.bindFramebuffer( gl.FRAMEBUFFER, null );
+gl.bindTexture( gl.TEXTURE_2D, null );
+
+/**************
+ * FRAME LOOP *
+ **************/
+
+function DrawHeightfield()
+{
+	gl.bindFramebuffer( gl.FRAMEBUFFER, heightBuffer.frameBuffer );
+    gl.viewport(0, 0, heightBuffer.frameBuffer.width, heightBuffer.frameBuffer.height);
+	gl.clearColor(0.0, 0.0, 0.0, 1.0);
+	gl.clear(gl.COLOR_BUFFER_BIT);
+	gl.disable(gl.DEPTH_TEST);
+	
+	gl.useProgram( generateHeight.effect );
+
+	gl.uniform2f( gl.getUniformLocation( generateHeight.effect, "gHeightfieldResolution" ), heightBuffer.width, heightBuffer.height );
+	
+	gl.bindVertexArray(fullScreenTri.va);
+	gl.drawArrays(gl.TRIANGLE_STRIP, 0, fullScreenTri.count);
+
+	// do we actually need to clean up?
+	gl.bindVertexArray(null);
+	gl.useProgram(null);
+	gl.bindTexture(gl.TEXTURE_2D, null);
+	gl.bindFramebuffer( gl.FRAMEBUFFER, null );
+	gl.viewport(0, 0, canvas.width, canvas.height );
+}
+
+// Update the game data buffer for the next frame
+var flip = 0;
+function Update()
+{
+	flip = 1-flip;
+
+	gl.bindFramebuffer( gl.FRAMEBUFFER, gameDataBuffer[flip].frameBuffer );
+    gl.viewport(0, 0, gameDataBuffer[flip].frameBuffer.width, gameDataBuffer[flip].frameBuffer.height);
+	gl.clearColor(0.0, 0.0, 0.0, 1.0);
+	gl.clear( gl.COLOR_BUFFER_BIT );
+	gl.disable(gl.DEPTH_TEST);
+	
+	gl.useProgram( updateEffect.effect );
+
+	// bind the game data buffer as a texture, so the shader can read the previous frame's values and update them
+	gl.activeTexture( gl.TEXTURE0 );
+	gl.bindTexture( gl.TEXTURE_2D, gameDataBuffer[1-flip].texture );
+	gl.uniform1i( gl.getUniformLocation( updateEffect.effect, "gameDataBuffer" ), 0 ); // this never changes, can we just hardcode it in the shader?
+
+	// Read the gamepad	and pass straight through to the shader
+	let pad = navigator.getGamepads()[0];
+	if ( pad && pad.axes ) gl.uniform4f( gl.getUniformLocation( updateEffect.effect, "gamepad0_axes" ), pad.axes[0], pad.axes[1], pad.axes[2], pad.axes[3] );
+	if ( pad && pad.buttons )
+	{
+		gl.uniform4f( gl.getUniformLocation( updateEffect.effect, "gamepad0_buttons0" ), pad.buttons[ 0].value, pad.buttons[ 1].value, pad.buttons[ 2].value, pad.buttons[ 3].value );
+		gl.uniform4f( gl.getUniformLocation( updateEffect.effect, "gamepad0_buttons1" ), pad.buttons[ 4].value, pad.buttons[ 5].value, pad.buttons[ 6].value, pad.buttons[ 7].value );
+		gl.uniform4f( gl.getUniformLocation( updateEffect.effect, "gamepad0_buttons2" ), pad.buttons[ 8].value, pad.buttons[ 9].value, pad.buttons[10].value, pad.buttons[11].value );
+		gl.uniform4f( gl.getUniformLocation( updateEffect.effect, "gamepad0_buttons3" ), pad.buttons[12].value, pad.buttons[13].value, pad.buttons[14].value, pad.buttons[15].value );
+	}
+
+	gl.bindVertexArray(fullScreenTri.va);
+	gl.drawArrays(gl.TRIANGLE_STRIP, 0, fullScreenTri.count);
+
+	// do we actually need to clean up?
+	gl.bindVertexArray(null);
+	gl.useProgram(null);
+	gl.bindTexture(gl.TEXTURE_2D, null);
+	gl.bindFramebuffer( gl.FRAMEBUFFER, null );
+	gl.viewport(0, 0, canvas.width, canvas.height );
+}
+
+// Render the scene with data from the current game data buffer
+function Render()
+{
+	gl.bindFramebuffer( gl.FRAMEBUFFER, null );
+	gl.viewport(0, 0, canvas.width, canvas.height );
+	gl.clearColor( .4, .7, 1, 1 );
+	gl.clear( gl.COLOR_BUFFER_BIT );
+	gl.enable(gl.DEPTH_TEST);
+	gl.depthFunc(gl.LEQUAL);
+	
+	gl.useProgram( renderHeightfield.effect );
+
+	gl.activeTexture( gl.TEXTURE0 );
+	gl.bindTexture( gl.TEXTURE_2D, gameDataBuffer[flip].texture );
+	gl.uniform1i( gl.getUniformLocation( renderHeightfield.effect, "gameDataBuffer" ), 0 ); // this never changes, can we just hardcode it in the shader?
+
+	gl.activeTexture( gl.TEXTURE1 );
+	gl.bindTexture( gl.TEXTURE_2D, heightBuffer.texture );
+	gl.uniform1i( gl.getUniformLocation( renderHeightfield.effect, "gHeightfield" ), 1 ); // this never changes, can we just hardcode it in the shader?
+	
+	gl.uniform2f( gl.getUniformLocation( renderHeightfield.effect, "gHeightfieldResolution" ), heightBuffer.width, heightBuffer.height );
+	gl.uniform2f( gl.getUniformLocation( renderHeightfield.effect, "gResolution" ), canvas.width, canvas.height );
+	
+	gl.bindVertexArray( heightfield.vertexArray );
+	gl.bindBuffer( gl.ELEMENT_ARRAY_BUFFER, heightfield.indexArray );
+	gl.drawElements( gl.TRIANGLES, heightfield.indexCount, gl.UNSIGNED_INT, 0 );
+	gl.bindBuffer( gl.ELEMENT_ARRAY_BUFFER, null );
+	gl.bindVertexArray( null );
+	
+	gl.useProgram(null);
+	gl.bindTexture(gl.TEXTURE_2D, null);
+}
+
+
+DrawHeightfield();
+
+function Frame()// timestep )
+{
+	Update();
+	Render();
+	
+	window.requestAnimationFrame(Frame);
+}
+window.requestAnimationFrame(Frame);
+		
+		</script>
+	</body>
+</html>
