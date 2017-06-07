@@ -383,7 +383,7 @@ renderHeightfield.vertexShader.source =
 		viewPos = worldPos - data.pos.xyz;
 		viewPos = InvRotate(viewPos,data.rot);
 		
-		float aspect = 16./9.;
+		float aspect = gResolution.x/gResolution.y;
 		float zoom = 1.5;
 		
 		gl_Position.x = viewPos.x;
