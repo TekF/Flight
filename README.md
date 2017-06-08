@@ -1,11 +1,12 @@
 # Flight
 A series of WebGL sketches about flight.
 
- * [Drive](http://TekF.github.io/Flight/drive.html) - move along the ground.
- * [Fly](http://TekF.github.io/Flight/fly.html) - vertical movement.
- * [Heightfield](http://TekF.github.io/Flight/heightfield.html) - replace the checkerboard with a generated heightfield.
- * [Quaternion](http://TekF.github.io/Flight/quaternion.html) - free rotation! Fly like a plane!
- * [Full Screen](http://TekF.github.io/Flight/fullscreen.html) - full-size canvas, wider FOV, higher quality terrain, better albedo pattern.
+ * [Arrow](http://TekF.github.io/Flight/arrowdrive.html) - Drive an arrow in 2D.
+ * [Drive](http://TekF.github.io/Flight/drive.html) - Drive a 3D camera along the ground.
+ * [Fly](http://TekF.github.io/Flight/fly.html) - Add vertical movement.
+ * [Heightfield](http://TekF.github.io/Flight/heightfield.html) - Replace the checkerboard with a generated heightfield.
+ * [Quaternion](http://TekF.github.io/Flight/quaternion.html) - Free rotation! Fly like a plane!
+ * [Full Screen](http://TekF.github.io/Flight/fullscreen.html) - Full-size canvas, wider FOV, higher quality terrain, better albedo pattern.
 
 # Controls
 
